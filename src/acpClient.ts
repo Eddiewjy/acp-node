@@ -1,19 +1,26 @@
-import { Address, http, parseEther } from "viem";
+import { Address, parseEther } from "viem";
 import { io } from "socket.io-client";
-import AcpContractClient, { AcpJobPhases, MemoType } from "./acpContractClient";
-import { AcpAgent, AcpAgentSort } from "./interfaces";
+import AcpContractClient, {
+  AcpJobPhases,
+  FeeType,
+  MemoType,
+} from "./acpContractClient";
 import AcpJob from "./acpJob";
 import AcpMemo from "./acpMemo";
 import AcpJobOffering from "./acpJobOffering";
 import {
+  AcpAgent,
+  AcpAgentSort,
+  AcpGraduationStatus,
+  AcpOnlineStatus,
+  GenericPayload,
   IAcpClientOptions,
   IAcpJob,
   IAcpJobResponse,
   IAcpMemo,
+  IDeliverable,
 } from "./interfaces";
 const { version } = require("../package.json");
-import { publicActionsL2 } from 'viem/op-stack';
-import { createPublicClient, PublicClient } from "viem";
 
 enum SocketEvents {
   ROOM_JOINED = "roomJoined",
@@ -24,9 +31,9 @@ enum SocketEvents {
 interface IAcpBrowseAgentsOptions {
   cluster?: string;
   sort_by?: AcpAgentSort[];
-  rerank?: boolean;
   top_k?: number;
-  graduated?: boolean;
+  graduationStatus?: AcpGraduationStatus;
+  onlineStatus?: AcpOnlineStatus;
 }
 
 export class EvaluateResult {
@@ -42,7 +49,7 @@ export class EvaluateResult {
 class AcpClient {
   private acpUrl;
   public acpContractClient: AcpContractClient;
-  private onNewTask?: (job: AcpJob) => void;
+  private onNewTask?: (job: AcpJob, memoToSign?: AcpMemo) => void;
   private onEvaluate?: (job: AcpJob) => void;
 
   constructor(options: IAcpClientOptions) {
@@ -97,7 +104,10 @@ class AcpClient {
                 memo.id,
                 memo.memoType,
                 memo.content,
-                memo.nextPhase
+                memo.nextPhase,
+                memo.status,
+                memo.signedReason,
+                memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
               );
             }),
             data.phase,
@@ -128,14 +138,20 @@ class AcpClient {
                 memo.id,
                 memo.memoType,
                 memo.content,
-                memo.nextPhase
+                memo.nextPhase,
+                memo.status,
+                memo.signedReason,
+                memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
               );
             }),
             data.phase,
             data.context
           );
 
-          this.onNewTask(job);
+          this.onNewTask(
+            job,
+            job.memos.find((m) => m.id == data.memoToSign)
+          );
         }
       }
     );
@@ -151,35 +167,33 @@ class AcpClient {
   }
 
   async browseAgents(keyword: string, options: IAcpBrowseAgentsOptions) {
-    let { cluster, sort_by, rerank, top_k, graduated } = options;
-    rerank = rerank ?? true;
+    let { cluster, sort_by, top_k, graduationStatus, onlineStatus } = options;
     top_k = top_k ?? 5;
-    graduated = graduated ?? true;
 
-    let url = `${this.acpUrl}/api/agents?search=${keyword}`;
+    let url = `${this.acpUrl}/api/agents/v2/search?search=${keyword}`;
 
     if (sort_by && sort_by.length > 0) {
-      url += `&sort=${sort_by.map((s) => s).join(",")}`;
+      url += `&sortBy=${sort_by.map((s) => s).join(",")}`;
     }
 
     if (top_k) {
       url += `&top_k=${top_k}`;
     }
 
-    if (rerank) {
-      url += `&rerank=true`;
-    }
-
     if (this.acpContractClient.walletAddress) {
-      url += `&filters[walletAddress][$notIn]=${this.acpContractClient.walletAddress}`;
+      url += `&walletAddressesToExclude=${this.acpContractClient.walletAddress}`;
     }
 
     if (cluster) {
-      url += `&filters[cluster]=${cluster}`;
+      url += `&cluster=${cluster}`;
     }
 
-    if (graduated === false) {
-      url += `&filters[hasGraduated]=false`;
+    if (graduationStatus) {
+      url += `&graduationStatus=${graduationStatus}`;
+    }
+
+    if (onlineStatus) {
+      url += `&onlineStatus=${onlineStatus}`;
     }
 
     const response = await fetch(url);
@@ -221,10 +235,12 @@ class AcpClient {
       expiredAt
     );
 
-    await this.acpContractClient.setBudget(
-      jobId,
-      parseEther(amount.toString())
-    );
+    if (amount > 0) {
+      await this.acpContractClient.setBudget(
+        jobId,
+        parseEther(amount.toString())
+      );
+    }
 
     await this.acpContractClient.createMemo(
       jobId,
@@ -243,6 +259,7 @@ class AcpClient {
     jobId: number,
     memoId: number,
     accept: boolean,
+    content?: string,
     reason?: string
   ) {
     await this.acpContractClient.signMemo(memoId, accept, reason);
@@ -253,7 +270,7 @@ class AcpClient {
 
     return await this.acpContractClient.createMemo(
       jobId,
-      `Job ${jobId} accepted. ${reason ?? ""}`,
+      content ?? `Job ${jobId} accepted. ${reason ?? ""}`,
       MemoType.MESSAGE,
       false,
       AcpJobPhases.TRANSACTION
@@ -261,9 +278,11 @@ class AcpClient {
   }
 
   async payJob(jobId: number, amount: number, memoId: number, reason?: string) {
-    await this.acpContractClient.approveAllowance(
-      parseEther(amount.toString())
-    );
+    if (amount > 0) {
+      await this.acpContractClient.approveAllowance(
+        parseEther(amount.toString())
+      );
+    }
 
     await this.acpContractClient.signMemo(memoId, true, reason);
 
@@ -276,10 +295,105 @@ class AcpClient {
     );
   }
 
-  async deliverJob(jobId: number, deliverable: string) {
+  async requestFunds<T>(
+    jobId: number,
+    amount: number,
+    recipient: Address,
+    feeAmount: number,
+    feeType: FeeType,
+    reason: GenericPayload<T>,
+    nextPhase: AcpJobPhases,
+    expiredAt: Date
+  ) {
+    return await this.acpContractClient.createPayableMemo(
+      jobId,
+      JSON.stringify(reason),
+      parseEther(amount.toString()),
+      recipient,
+      parseEther(feeAmount.toString()),
+      feeType,
+      nextPhase,
+      MemoType.PAYABLE_REQUEST,
+      expiredAt
+    );
+  }
+
+  async responseFundsRequest(
+    memoId: number,
+    accept: boolean,
+    amount: number,
+    reason?: string
+  ) {
+    if (!accept) {
+      return await this.acpContractClient.signMemo(memoId, accept, reason);
+    }
+
+    if (amount > 0) {
+      await this.acpContractClient.approveAllowance(
+        parseEther(amount.toString())
+      );
+    }
+
+    return await this.acpContractClient.signMemo(memoId, true, reason);
+  }
+
+  async transferFunds<T>(
+    jobId: number,
+    amount: number,
+    recipient: Address,
+    feeAmount: number,
+    feeType: FeeType,
+    reason: GenericPayload<T>,
+    nextPhase: AcpJobPhases,
+    expiredAt: Date
+  ) {
+    const totalAmount = amount + feeAmount;
+
+    if (totalAmount > 0) {
+      await this.acpContractClient.approveAllowance(
+        parseEther(totalAmount.toString())
+      );
+    }
+
+    return await this.acpContractClient.createPayableMemo(
+      jobId,
+      JSON.stringify(reason),
+      parseEther(amount.toString()),
+      recipient,
+      parseEther(feeAmount.toString()),
+      feeType,
+      nextPhase,
+      MemoType.PAYABLE_TRANSFER_ESCROW,
+      expiredAt
+    );
+  }
+
+  async sendMessage<T>(
+    jobId: number,
+    message: GenericPayload<T>,
+    nextPhase: AcpJobPhases
+  ) {
     return await this.acpContractClient.createMemo(
       jobId,
-      deliverable,
+      JSON.stringify(message),
+      MemoType.MESSAGE,
+      false,
+      nextPhase
+    );
+  }
+
+  async responseFundsTransfer(
+    memoId: number,
+    accept: boolean,
+    reason?: string
+  ) {
+    return await this.acpContractClient.signMemo(memoId, accept, reason);
+  }
+
+  async deliverJob(jobId: number, deliverable: IDeliverable) {
+    return await this.acpContractClient.createMemo(
+      jobId,
+      JSON.stringify(deliverable),
       MemoType.OBJECT_URL,
       true,
       AcpJobPhases.COMPLETED
@@ -316,7 +430,10 @@ class AcpClient {
               memo.id,
               memo.memoType,
               memo.content,
-              memo.nextPhase
+              memo.nextPhase,
+              memo.status,
+              memo.signedReason,
+              memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
             );
           }),
           job.phase,
@@ -358,7 +475,10 @@ class AcpClient {
               memo.id,
               memo.memoType,
               memo.content,
-              memo.nextPhase
+              memo.nextPhase,
+              memo.status,
+              memo.signedReason,
+              memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
             );
           }),
           job.phase,
@@ -399,7 +519,10 @@ class AcpClient {
               memo.id,
               memo.memoType,
               memo.content,
-              memo.nextPhase
+              memo.nextPhase,
+              memo.status,
+              memo.signedReason,
+              memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
             );
           }),
           job.phase,
@@ -445,7 +568,10 @@ class AcpClient {
             memo.id,
             memo.memoType,
             memo.content,
-            memo.nextPhase
+            memo.nextPhase,
+            memo.status,
+            memo.signedReason,
+            memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
           );
         }),
         job.phase,
@@ -482,7 +608,10 @@ class AcpClient {
         memo.id,
         memo.memoType,
         memo.content,
-        memo.nextPhase
+        memo.nextPhase,
+        memo.status,
+        memo.signedReason,
+        memo.expiry ? new Date(parseInt(memo.expiry)) : undefined
       );
     } catch (error) {
       throw error;
